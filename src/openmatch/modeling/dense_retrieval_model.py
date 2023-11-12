@@ -40,6 +40,7 @@ class DRModel(nn.Module):
             lm_q: PreTrainedModel,
             lm_p: PreTrainedModel,
             tied: bool = True,
+            maxp: bool = False,
             feature: str = "last_hidden_state",
             pooling: str = "first",
             head_q: nn.Module = None,
@@ -64,6 +65,7 @@ class DRModel(nn.Module):
         self.model_args = model_args
         self.train_args = train_args
         self.data_args = data_args
+        self.maxp = maxp
 
         if train_args is not None:
             if train_args.distillation:
@@ -151,6 +153,9 @@ class DRModel(nn.Module):
                 else self.train_args.per_device_train_batch_size
 
             scores = torch.matmul(q_reps, p_reps.transpose(0, 1))
+
+            if self.maxp:
+                scores = torch.max(scores.view(scores.size(0),int(scores.size(1)/self.maxp), self.maxp), dim=2).values
 
             target = torch.arange(
                 scores.size(0),
@@ -309,6 +314,7 @@ class DRModel(nn.Module):
             model_args=model_args,
             data_args=data_args,
             train_args=train_args,
+            maxp=model_args.maxp
         )
         return model
 
