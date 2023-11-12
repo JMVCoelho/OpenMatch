@@ -78,31 +78,59 @@ class SimpleTrainPreProcessor:
         )
         return query_encoded
 
-    def get_passage(self, p):
+    def get_passage(self, p, split_token):
         entry = self.collection[int(p)] if p != "None" else self.collection[0]
         title = entry[self.title_field]
         title = "" if title is None else title
         body = entry[self.text_field]
-        if self.doc_template is None:
-            content = title + self.tokenizer.sep_token + body
-        else:
-            content = fill_template(self.doc_template, data=entry, allow_not_found=self.allow_not_found)
 
-        passage_encoded = self.tokenizer.encode(
-            content,
-            add_special_tokens=False,
-            max_length=self.doc_max_len,
-            truncation=True
-        )
+        if not split_token:
 
-        return passage_encoded
+            if self.doc_template is None:
+                content = title + self.tokenizer.sep_token + body
+            else:
+                content = fill_template(self.doc_template, data=entry, allow_not_found=self.allow_not_found)
 
+            passage_encoded = self.tokenizer.encode(
+                content,
+                add_special_tokens=False,
+                max_length=self.doc_max_len,
+                truncation=True
+            )
+
+            return passage_encoded
+
+        else: 
+            split_body = body.split(split_token)
+            contents = []
+            for text in split_body:
+                if self.doc_template is None:
+                    content = title + self.tokenizer.sep_token + text
+                else:
+                    content = fill_template(self.doc_template, data={self.title_field: title, self.text_field: text}, allow_not_found=self.allow_not_found)
+
+                contents.append(content)
+            
+            encoded = []
+            for content in contents:
+                passage_encoded = self.tokenizer.encode(
+                    content,
+                    add_special_tokens=False,
+                    max_length=self.doc_max_len,
+                    truncation=True
+                )
+                encoded.append(passage_encoded)
+            
+            return encoded
+
+
+        
     def process_one(self, train):
-        q, pp, nn = train
+        q, pp, nn, split_token = train
         train_example = {
             'query': self.get_query(q),
-            'positives': [self.get_passage(p) for p in pp],
-            'negatives': [self.get_passage(n) for n in nn],
+            'positives': [self.get_passage(p, split_token) for p in pp],
+            'negatives': [self.get_passage(n, split_token) for n in nn],
         }
 
         return json.dumps(train_example)

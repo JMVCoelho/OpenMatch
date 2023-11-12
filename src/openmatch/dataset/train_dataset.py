@@ -32,7 +32,8 @@ class TrainDatasetBase:
         trainer: DRTrainer = None,
         is_eval: bool = False,
         shuffle_seed: int = None,
-        cache_dir: str = None
+        cache_dir: str = None,
+        maxp: int = None
     ) -> None:
         self.tokenizer = tokenizer
         self.data_args = data_args
@@ -40,6 +41,7 @@ class TrainDatasetBase:
         self.p_max_len = data_args.p_max_len
         self.trainer = trainer
         self.is_eval = is_eval
+        self.maxp = maxp
         self._prepare_data(data_args, shuffle_seed, cache_dir)
 
     def _prepare_data(self, data_args, shuffle_seed, cache_dir):
@@ -132,7 +134,12 @@ class DRTrainDataset(TrainDatasetBase):
             else:
                 pos_psg = group_positives[(
                     hashed_seed + epoch) % len(group_positives)]
-            encoded_passages.append(self.create_one_example(pos_psg))
+                
+            if not self.maxp:
+                encoded_passages.append(self.create_one_example(pos_psg))
+            else:
+                for pos in pos_psg:
+                    encoded_passages.append(self.create_one_example(pos))
 
             negative_size = self.data_args.train_n_passages - 1
             if len(group_negatives) < negative_size:
@@ -154,10 +161,18 @@ class DRTrainDataset(TrainDatasetBase):
                 negs = negs * 2
                 negs = negs[_offset: _offset + negative_size]
 
-            for neg_psg in negs:
-                encoded_passages.append(self.create_one_example(neg_psg))
+            if not self.maxp:
+                for neg_psg in negs:
+                    encoded_passages.append(self.create_one_example(neg_psg))
+            else:
+                for neg_psg in negs:
+                    for neg in neg_psg:
+                        encoded_passages.append(self.create_one_example(neg))
 
-            assert len(encoded_passages) == self.data_args.train_n_passages
+            if not self.maxp:
+                assert len(encoded_passages) == self.data_args.train_n_passages
+            else:
+                assert len(encoded_passages) == self.data_args.train_n_passages * self.maxp
 
             # Avoid name conflict with query in the original dataset
             return {"query_": encoded_query, "passages": encoded_passages}

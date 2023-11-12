@@ -42,6 +42,11 @@ class ModelArguments:
         metadata={"help": "How to pool the features from the HF PLM"}
     )
 
+    maxp: int = field(
+        default=None,
+        metadata={"help": "number of maxp passages. defaults to none - no maxp."}
+    )
+
     # out projection
     add_linear_head: bool = field(default=False)
     projection_in_dim: int = field(default=768)

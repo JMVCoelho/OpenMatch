@@ -87,13 +87,15 @@ def main():
         tokenizer, 
         data_args, 
         shuffle_seed=training_args.seed, 
-        cache_dir=data_args.data_cache_dir or model_args.cache_dir
+        cache_dir=data_args.data_cache_dir or model_args.cache_dir,
+        maxp=model_args.maxp
     )
     eval_dataset = train_dataset_cls(
         tokenizer, 
         data_args, 
         is_eval=True, 
-        cache_dir=data_args.data_cache_dir or model_args.cache_dir
+        cache_dir=data_args.data_cache_dir or model_args.cache_dir,
+        maxp=model_args.maxp
     ) if data_args.eval_path is not None else None
 
 
