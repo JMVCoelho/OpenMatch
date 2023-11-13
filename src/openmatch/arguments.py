@@ -47,6 +47,11 @@ class ModelArguments:
         metadata={"help": "number of maxp passages. defaults to none - no maxp."}
     )
 
+    fusion: int = field(
+        default=None,
+        metadata={"help": "number of fusion in decoder passages. defaults to none - no fusion in decoder."}
+    )
+
     # out projection
     add_linear_head: bool = field(default=False)
     projection_in_dim: int = field(default=768)

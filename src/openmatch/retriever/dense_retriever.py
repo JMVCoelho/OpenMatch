@@ -63,7 +63,7 @@ class Retriever:
             vres, vdev, self.index, co)
         self.index_on_gpu = True
 
-    def doc_embedding_inference(self):
+    def doc_embedding_inference(self, maxp, fusion):
         # Note: during evaluation, there's no point in wrapping the model
         # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
         if self.corpus_dataset is None:
@@ -85,14 +85,24 @@ class Retriever:
         for (batch_ids, batch) in tqdm(dataloader, disable=self.args.process_index > 0):
             lookup_indices.extend(batch_ids)
             idx += len(batch_ids)
+
+            if maxp or fusion:
+                bsize, fnumber, psize = batch['input_ids'].shape
+                batch['input_ids'] = batch['input_ids'].view(bsize*fnumber, psize)
+                batch['attention_mask'] = batch['attention_mask'].view(bsize*fnumber, psize)
+
             with amp.autocast() if self.args.fp16 else nullcontext():
                 with torch.no_grad():
                     for k, v in batch.items():
                         batch[k] = v.to(self.args.device)
                     model_output: DROutput = self.model(passage=batch)
                     encoded.append(model_output.p_reps.cpu().detach().numpy())
+                    
             if len(lookup_indices) >= self.args.max_inmem_docs // self.args.world_size:
                 encoded = np.concatenate(encoded)
+                if maxp:
+                    lookup_indices = [item for item in lookup_indices for _ in range(maxp)]
+                assert len(encoded) == len(lookup_indices)
                 with open(os.path.join(self.args.output_dir, "embeddings.corpus.rank.{}.{}-{}".format(self.args.process_index, prev_idx, idx)), 'wb') as f:
                     pickle.dump((encoded, lookup_indices), f, protocol=4)
                 encoded = []
@@ -102,6 +112,9 @@ class Retriever:
 
         if len(lookup_indices) > 0:
             encoded = np.concatenate(encoded)
+            if maxp:
+                lookup_indices = [item for item in lookup_indices for _ in range(maxp)]
+            assert len(encoded) == len(lookup_indices)
             with open(os.path.join(self.args.output_dir, "embeddings.corpus.rank.{}.{}-{}".format(self.args.process_index, prev_idx, idx)), 'wb') as f:
                 pickle.dump((encoded, lookup_indices), f, protocol=4)
 
@@ -140,9 +153,9 @@ class Retriever:
         return retriever
 
     @classmethod
-    def build_embeddings(cls, model: DRModelForInference, corpus_dataset: IterableDataset, args: EncodingArguments):
+    def build_embeddings(cls, model: DRModelForInference, corpus_dataset: IterableDataset, args: EncodingArguments, maxp: int = None, fusion: int = None):
         retriever = cls(model, corpus_dataset, args)
-        retriever.doc_embedding_inference()
+        retriever.doc_embedding_inference(maxp, fusion)
         return retriever
 
     @classmethod

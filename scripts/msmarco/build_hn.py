@@ -10,7 +10,7 @@ from multiprocessing import Pool
 from openmatch.utils import SimpleTrainPreProcessor as TrainPreProcessor
 
 
-def load_ranking(rank_file, relevance, n_sample, depth):
+def load_ranking(rank_file, relevance, n_sample, depth, split_token):
     with open(rank_file) as rf:
         lines = iter(rf)
         q_0, _, p_0, _, _, _ = next(lines).strip().split()
@@ -24,7 +24,7 @@ def load_ranking(rank_file, relevance, n_sample, depth):
                 if q != curr_q:
                     negatives = negatives[:depth]
                     random.shuffle(negatives)
-                    yield curr_q, relevance[curr_q], negatives[:n_sample]
+                    yield curr_q, relevance[curr_q], negatives[:n_sample], split_token
                     curr_q = q
                     negatives = [] if p in relevance[q] else [p]
                 else:
@@ -33,7 +33,7 @@ def load_ranking(rank_file, relevance, n_sample, depth):
             except StopIteration:
                 negatives = negatives[:depth]
                 random.shuffle(negatives)
-                yield curr_q, relevance[curr_q], negatives[:n_sample]
+                yield curr_q, relevance[curr_q], negatives[:n_sample], split_token
                 return
 
 
@@ -53,6 +53,7 @@ parser.add_argument('--n_sample', type=int, default=30)
 parser.add_argument('--depth', type=int, default=200)
 parser.add_argument('--mp_chunk_size', type=int, default=500)
 parser.add_argument('--shard_size', type=int, default=45000)
+parser.add_argument('--split_sentences', type=str, default=None)
 
 args = parser.parse_args()
 
@@ -73,7 +74,7 @@ shard_id = 0
 f = None
 os.makedirs(args.save_to, exist_ok=True)
 
-pbar = tqdm(load_ranking(args.hn_file, qrel, args.n_sample, args.depth))
+pbar = tqdm(load_ranking(args.hn_file, qrel, args.n_sample, args.depth, args.split_sentences))
 with Pool() as p:
     for x in p.imap(processor.process_one, pbar, chunksize=args.mp_chunk_size):
         counter += 1
