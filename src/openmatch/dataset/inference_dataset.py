@@ -94,7 +94,7 @@ class InferenceDataset():
         data_args: DataArguments = None, 
         data: List[Dict] = None,
         data_files: Union[str, List[str]] = None,
-        max_len: int = 128,
+        max_len: int = None,
         template: str = None,
         column_names: str = None,
         all_markers: str = None,
