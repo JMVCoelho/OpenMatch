@@ -19,8 +19,10 @@ parser.add_argument('--collection', required=True)
 parser.add_argument('--save_to', required=True)
 parser.add_argument('--doc_template', type=str, default=None)
 parser.add_argument('--query_template', type=str, default=None)
+parser.add_argument('--columns', type=str, default="text_id,title,text")
 
 parser.add_argument('--truncate', type=int, default=128)
+parser.add_argument('--truncate_q', type=int, default=32)
 parser.add_argument('--n_sample', type=int, default=30)
 parser.add_argument('--mp_chunk_size', type=int, default=500)
 parser.add_argument('--shard_size', type=int, default=45000)
@@ -45,9 +47,11 @@ processor = TrainPreProcessor(
     collection_file=args.collection,
     tokenizer=tokenizer,
     doc_max_len=args.truncate,
+    query_max_len=args.truncate_q,
     doc_template=args.doc_template,
     query_template=args.query_template,
-    allow_not_found=True
+    allow_not_found=True,
+    columns=args.columns.split(",")
 )
 
 counter = 0

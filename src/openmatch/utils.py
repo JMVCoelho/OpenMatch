@@ -23,10 +23,11 @@ class SimpleTrainPreProcessor:
     query_file: str
     collection_file: str
     tokenizer: PreTrainedTokenizer
+    columns: str
 
     doc_max_len: int = 128
     query_max_len: int = 32
-    columns = ['text_id', 'title', 'text']
+    #columns = ['text_id', 'title', 'text']
     title_field = 'title'
     text_field = 'text'
     query_field = 'text'
@@ -80,8 +81,12 @@ class SimpleTrainPreProcessor:
 
     def get_passage(self, p, split_token):
         entry = self.collection[int(p)] if p != "None" else self.collection[0]
-        title = entry[self.title_field]
-        title = "" if title is None else title
+        if "title" in self.columns:
+            title = entry[self.title_field]
+            title = "" if title is None else title
+        
+        else:
+            title = ""
         body = entry[self.text_field]
 
         if not split_token:

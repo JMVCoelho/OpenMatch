@@ -41,8 +41,54 @@ class T5ModelWithFusion(T5Model):
 
         use_cache = False
 
+        aggregator_window = False
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        def revert_concatenated_tensor(concatenated_tensor):
+            N_by_4, full_dim = concatenated_tensor.shape
+            reverted_tensor = concatenated_tensor.reshape(N_by_4, -1, full_dim//4)
+            N = N_by_4 * 4
+            reverted_tensor = reverted_tensor.view(N, full_dim//4)
+            return reverted_tensor
+
+        if fusion:
+            input_ids = revert_concatenated_tensor(input_ids)
+            attention_mask = revert_concatenated_tensor(attention_mask)
+
+            
+
+
+        def custom_interleave(tensor1, fusion):
+            n_docs, dim = tensor1.shape
+
+            n_docs_fusion = n_docs // fusion
+
+            tensor2 = tensor1.view(int(n_docs/fusion), fusion, dim)[:, :, :int(dim/fusion)].reshape(int(n_docs/fusion), dim)
+
+            interleaved = torch.empty((n_docs + n_docs_fusion, dim), dtype=tensor1.dtype)
+
+            interleaved[::fusion + 1] = tensor2[:n_docs_fusion]
+
+            idx = 0
+            for i in range(n_docs_fusion):
+                interleaved[idx + 1:idx + fusion + 1] = tensor1[i * fusion: (i + 1) * fusion]
+                idx += fusion + 1
+
+            return interleaved
+
+        if aggregator_window and fusion:
+            device = input_ids.device
+            new_input_ids = custom_interleave(input_ids, fusion)
+            new_attention_mask = custom_interleave(attention_mask, fusion)
+            
+            del input_ids
+            del attention_mask
+
+            input_ids = new_input_ids.to(device)
+            attention_mask = new_attention_mask.to(device)
+            
 
         # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
         if head_mask is not None and decoder_head_mask is None:
@@ -86,15 +132,18 @@ class T5ModelWithFusion(T5Model):
                 decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
         
         if fusion:
+            fusion_parameter = fusion if not aggregator_window else fusion+1
             dim = hidden_states.size(1)
-            fused_samples = int(len(decoder_input_ids)/fusion)
-            fused_dimensionality = int(dim*fusion)
             len_decoding = len(decoder_input_ids)
+            #fused_samples = int(len_decoding/fusion)
+            fused_samples = int(len_decoding)
+            fused_dimensionality = int(dim*fusion_parameter)
+            
 
             hidden_states=hidden_states.view(fused_samples, fused_dimensionality, hidden_states.size(-1))
             attention_mask=attention_mask.view(fused_samples, fused_dimensionality)
-            decoder_input_ids = decoder_input_ids[list(range(0,len_decoding, fusion))]
-
+            #decoder_input_ids = decoder_input_ids[list(range(0,len_decoding, fusion))]
+            
         # Decode
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,

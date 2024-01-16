@@ -91,6 +91,7 @@ def main():
         maxp=model_args.maxp,
         fusion=model_args.fusion
     )
+
     eval_dataset = train_dataset_cls(
         tokenizer, 
         data_args, 
@@ -111,7 +112,8 @@ def main():
         data_collator=QPCollator(
             tokenizer,
             max_p_len=data_args.p_max_len,
-            max_q_len=data_args.q_max_len
+            max_q_len=data_args.q_max_len,
+            fusion=model_args.fusion
         ),
         delta_model=delta_model if model_args.param_efficient_method else None
     )

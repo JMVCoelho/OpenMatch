@@ -87,9 +87,15 @@ class Retriever:
             idx += len(batch_ids)
 
             if maxp or fusion:
+                # if batch size is 1500 with fusion of N, that means (1500, n, size)
+                # but model expects (1500*n, size)
                 bsize, fnumber, psize = batch['input_ids'].shape
-                batch['input_ids'] = batch['input_ids'].view(bsize*fnumber, psize)
-                batch['attention_mask'] = batch['attention_mask'].view(bsize*fnumber, psize)
+                
+                #batch['input_ids'] = batch['input_ids'].view(bsize*fnumber, psize)
+                #batch['attention_mask'] = batch['attention_mask'].view(bsize*fnumber, psize)
+
+                batch['input_ids'] = batch['input_ids'].view(bsize, psize*fnumber)
+                batch['attention_mask'] = batch['attention_mask'].view(bsize, psize*fnumber)
 
             with amp.autocast() if self.args.fp16 else nullcontext():
                 with torch.no_grad():

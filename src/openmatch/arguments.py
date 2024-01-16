@@ -52,6 +52,11 @@ class ModelArguments:
         metadata={"help": "number of fusion in decoder passages. defaults to none - no fusion in decoder."}
     )
 
+    rope: bool = field(
+        default=False,
+        metadata={"help": "set true for T5 with RoPE."}
+    )
+
     # out projection
     add_linear_head: bool = field(default=False)
     projection_in_dim: int = field(default=768)

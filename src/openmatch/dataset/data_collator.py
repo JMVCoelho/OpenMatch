@@ -6,6 +6,12 @@ import torch
 from transformers import DataCollatorWithPadding, DefaultDataCollator
 
 
+def concatenate_tensors_gradcache_fusion(original_tensor, fusion):
+        N, _ = original_tensor.shape
+        new_tensor = original_tensor[:N//fusion*fusion].reshape(N//fusion, fusion, -1)
+        concatenated_tensor = torch.cat(tuple(new_tensor.unbind(1)), dim=1)
+        return concatenated_tensor
+
 @dataclass
 class QPCollator(DataCollatorWithPadding):
     """
@@ -15,6 +21,7 @@ class QPCollator(DataCollatorWithPadding):
     """
     max_q_len: int = 32
     max_p_len: int = 128
+    fusion: int = None
 
     def __call__(self, features):
         qq = [f["query_"] for f in features]
@@ -37,6 +44,10 @@ class QPCollator(DataCollatorWithPadding):
             max_length=self.max_p_len,
             return_tensors="pt",
         )
+
+        if self.fusion:
+            d_collated['input_ids'] = concatenate_tensors_gradcache_fusion(d_collated['input_ids'], self.fusion)
+            d_collated['attention_mask'] = concatenate_tensors_gradcache_fusion(d_collated['attention_mask'], self.fusion)
 
         return q_collated, d_collated
 

@@ -21,6 +21,8 @@ from ..arguments import DataArguments
 from ..arguments import DRTrainingArguments as TrainingArguments
 from ..arguments import ModelArguments
 from .custom_models import T5ModelWithFusion
+from .nano_t5 import MyT5RoPE
+from .rope_t5 import T5ModelRoPE
 from ..utils import mean_pooling
 from .linear import LinearHead
 
@@ -189,6 +191,7 @@ class DRModel(nn.Module):
                 (items.input_ids.shape[0], 1), dtype=torch.long).to(items.input_ids.device)
             
             if fusion:
+
                 items_out = model(
                     **items, decoder_input_ids=decoder_input_ids, fusion=fusion, return_dict=True)
             else:
@@ -198,7 +201,8 @@ class DRModel(nn.Module):
                 hidden = items_out.last_hidden_state
                 reps = hidden[:, 0, :]
             else:
-                hidden = items_out.decoder_hidden_states[-1]
+                #hidden = items_out.decoder_hidden_states[-1]
+                hidden = items_out.decoder_hidden_states
                 reps = hidden[:, 0, :]
         elif "CLIP" in type(model).__name__:
             reps = hidden = items_out = model.get_text_features(
@@ -254,8 +258,17 @@ class DRModel(nn.Module):
                     model_class = getattr(
                         importlib.import_module("transformers"), model_name)
                 except AttributeError:
-                    model_class = getattr(
-                        importlib.import_module(".custom_models", package=__package__), model_name)
+                    try:
+                        model_class = getattr(
+                            importlib.import_module(".custom_models", package=__package__), model_name)
+                    except AttributeError:
+                        try:
+                            model_class = getattr(
+                                importlib.import_module(".nano_t5", package=__package__), model_name)
+                        except AttributeError:
+                            model_class = getattr(
+                                importlib.import_module(".rope_t5", package=__package__), model_name)
+
 
                 lm_q = lm_p = model_class.from_pretrained(
                     model_name_or_path,
@@ -314,9 +327,21 @@ class DRModel(nn.Module):
                 model_class = T5EncoderModel
             elif model_args.fusion:
                 model_class = T5ModelWithFusion
+                print("Loading FiD T5")
+            elif model_args.rope:
+                model_class = T5ModelRoPE
+                print("Loading RoPE T5!!!!")
             else:
                 model_class = AutoModel
-            lm_q = model_class.from_pretrained(model_name_or_path, **hf_kwargs)
+            try:
+                lm_q = model_class.from_pretrained(model_name_or_path, **hf_kwargs)
+                print("Loaded!!! Class:")
+                print(model_class)
+            except AttributeError as e:
+                print("Custom implementation without from_pretrained. Manually loading from config and state dict.")
+                lm_q = model_class(AutoConfig.from_pretrained(model_name_or_path))
+                lm_q.load_state_dict(torch.load(f"{model_name_or_path}/pytorch_model.bin"), strict=False)
+                print("done")
             lm_p = copy.deepcopy(lm_q) if not tied else lm_q
             if model_args.add_linear_head:
                 head_q = LinearHead(
