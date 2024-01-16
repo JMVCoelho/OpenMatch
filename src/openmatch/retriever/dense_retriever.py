@@ -63,7 +63,7 @@ class Retriever:
             vres, vdev, self.index, co)
         self.index_on_gpu = True
 
-    def doc_embedding_inference(self):
+    def doc_embedding_inference(self, maxp, fusion):
         # Note: during evaluation, there's no point in wrapping the model
         # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
         if self.corpus_dataset is None:
@@ -85,14 +85,30 @@ class Retriever:
         for (batch_ids, batch) in tqdm(dataloader, disable=self.args.process_index > 0):
             lookup_indices.extend(batch_ids)
             idx += len(batch_ids)
+
+            if maxp or fusion:
+                # if batch size is 1500 with fusion of N, that means (1500, n, size)
+                # but model expects (1500*n, size)
+                bsize, fnumber, psize = batch['input_ids'].shape
+                
+                #batch['input_ids'] = batch['input_ids'].view(bsize*fnumber, psize)
+                #batch['attention_mask'] = batch['attention_mask'].view(bsize*fnumber, psize)
+
+                batch['input_ids'] = batch['input_ids'].view(bsize, psize*fnumber)
+                batch['attention_mask'] = batch['attention_mask'].view(bsize, psize*fnumber)
+
             with amp.autocast() if self.args.fp16 else nullcontext():
                 with torch.no_grad():
                     for k, v in batch.items():
                         batch[k] = v.to(self.args.device)
                     model_output: DROutput = self.model(passage=batch)
                     encoded.append(model_output.p_reps.cpu().detach().numpy())
+                    
             if len(lookup_indices) >= self.args.max_inmem_docs // self.args.world_size:
                 encoded = np.concatenate(encoded)
+                if maxp:
+                    lookup_indices = [item for item in lookup_indices for _ in range(maxp)]
+                assert len(encoded) == len(lookup_indices)
                 with open(os.path.join(self.args.output_dir, "embeddings.corpus.rank.{}.{}-{}".format(self.args.process_index, prev_idx, idx)), 'wb') as f:
                     pickle.dump((encoded, lookup_indices), f, protocol=4)
                 encoded = []
@@ -102,6 +118,9 @@ class Retriever:
 
         if len(lookup_indices) > 0:
             encoded = np.concatenate(encoded)
+            if maxp:
+                lookup_indices = [item for item in lookup_indices for _ in range(maxp)]
+            assert len(encoded) == len(lookup_indices)
             with open(os.path.join(self.args.output_dir, "embeddings.corpus.rank.{}.{}-{}".format(self.args.process_index, prev_idx, idx)), 'wb') as f:
                 pickle.dump((encoded, lookup_indices), f, protocol=4)
 
@@ -140,9 +159,9 @@ class Retriever:
         return retriever
 
     @classmethod
-    def build_embeddings(cls, model: DRModelForInference, corpus_dataset: IterableDataset, args: EncodingArguments):
+    def build_embeddings(cls, model: DRModelForInference, corpus_dataset: IterableDataset, args: EncodingArguments, maxp: int = None, fusion: int = None):
         retriever = cls(model, corpus_dataset, args)
-        retriever.doc_embedding_inference()
+        retriever.doc_embedding_inference(maxp, fusion)
         return retriever
 
     @classmethod
@@ -197,7 +216,7 @@ class Retriever:
         if self.args.world_size > 1:
             torch.distributed.barrier()
 
-    def search(self, topk: int = 100):
+    def search(self, topk: int = 100, maxp: int = None):
         logger.info("Searching")
         if self.index is None:
             raise ValueError("Index is not initialized")
@@ -213,6 +232,11 @@ class Retriever:
         encoded = np.concatenate(encoded)
 
         return_dict = {}
+
+        if maxp:
+            #maxp: worst case need to return maxp*topk to see topk non-duplicate documents.
+            target_topk=topk
+            topk=topk*maxp
         D, I = self.index.search(encoded, topk)
         original_indices = np.array(self.doc_lookup)[I]
         q = 0
@@ -223,10 +247,26 @@ class Retriever:
                 doc_index = str(doc_index)
                 if self.args.remove_identical and qid == doc_index:
                     continue
-                return_dict[qid][doc_index] = {"score": float(score)}
+                
+                if doc_index not in return_dict[qid]:
+                    return_dict[qid][doc_index] = {"score": float(score)}
+                else: 
+                    # this is for maxp
+                    # in the current maxp implementation, one docid is associated with multiple vectores (one per paragraph)
+                    # keep the score of the largest one.
+                    # in principle, they are returned in order, so this never happens. but just in case:
+                    if score > return_dict[qid][doc_index]['score']:
+                        return_dict[qid][doc_index] = {"score": float(score)}
+
             q += 1
 
         logger.info("End searching with {} queries".format(len(return_dict)))
+
+        if maxp:
+            # keep only target_topk for each query
+            for qid in return_dict:
+                sorted_data = sorted(return_dict[qid].items(), key=lambda x: x[1]['score'], reverse=True)
+                return_dict[qid] = dict(sorted_data[:target_topk])
 
         return return_dict
 
@@ -234,7 +274,8 @@ class Retriever:
     def fill_retrieval_result_with_document_texts(
         retrieval_result: Union[Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, float]]],
         doc_id_to_doc,
-        single_query: bool = False
+        single_query: bool = False,
+        maxp: int = None,
     ):
         if single_query:
             for doc_id, score in retrieval_result.items():
@@ -253,13 +294,14 @@ class Retriever:
         query: str = None,
         tokenizer: PreTrainedTokenizer = None,
         doc_id_to_doc=None,
-        topk: int = 100
+        topk: int = 100,
+        maxp: int = None
     ):
         if query_dataset is not None:
             self.query_embedding_inference(query_dataset)
             result = {}
             if self.args.process_index == 0:
-                result = self.search(topk)
+                result = self.search(topk, maxp)
                 if doc_id_to_doc is not None:
                     self.fill_retrieval_result_with_document_texts(
                         result, doc_id_to_doc)
@@ -271,11 +313,15 @@ class Retriever:
         for k, v in query_tokenized.items():
             query_tokenized[k] = v.to(self.args.device)
         model_output: DROutput = self.model(query=query_tokenized)
+
+        topk = maxp*topk if maxp else topk
+        
         D, I = self.index.search(
             model_output.q_reps.cpu().detach().numpy(), topk)
         original_indices = np.array(self.doc_lookup)[I]
         D, original_indices = D[0].tolist(), original_indices[0].tolist()
         result = {}
+
         for score, index in zip(D, original_indices):
             result[index] = {"score": score}
         if doc_id_to_doc is not None:

@@ -87,13 +87,18 @@ def main():
         tokenizer, 
         data_args, 
         shuffle_seed=training_args.seed, 
-        cache_dir=data_args.data_cache_dir or model_args.cache_dir
+        cache_dir=data_args.data_cache_dir or model_args.cache_dir,
+        maxp=model_args.maxp,
+        fusion=model_args.fusion
     )
+
     eval_dataset = train_dataset_cls(
         tokenizer, 
         data_args, 
         is_eval=True, 
-        cache_dir=data_args.data_cache_dir or model_args.cache_dir
+        cache_dir=data_args.data_cache_dir or model_args.cache_dir,
+        maxp=model_args.maxp,
+        fusion=model_args.fusion
     ) if data_args.eval_path is not None else None
 
 
@@ -107,7 +112,8 @@ def main():
         data_collator=QPCollator(
             tokenizer,
             max_p_len=data_args.p_max_len,
-            max_q_len=data_args.q_max_len
+            max_q_len=data_args.q_max_len,
+            fusion=model_args.fusion
         ),
         delta_model=delta_model if model_args.param_efficient_method else None
     )

@@ -83,10 +83,12 @@ def main():
         batch_size=encoding_args.per_device_eval_batch_size,
         num_processes=encoding_args.world_size,
         process_index=encoding_args.process_index,
-        cache_dir=model_args.cache_dir
+        cache_dir=model_args.cache_dir,
+        maxp=model_args.maxp,
+        fusion=model_args.fusion
     )
 
-    Retriever.build_embeddings(model, corpus_dataset, encoding_args)
+    Retriever.build_embeddings(model, corpus_dataset, encoding_args, model_args.maxp, model_args.fusion)
 
 
 if __name__ == '__main__':

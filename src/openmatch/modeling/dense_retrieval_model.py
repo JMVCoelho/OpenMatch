@@ -20,8 +20,12 @@ from transformers.modeling_outputs import ModelOutput
 from ..arguments import DataArguments
 from ..arguments import DRTrainingArguments as TrainingArguments
 from ..arguments import ModelArguments
+from .custom_models import T5ModelWithFusion
+from .nano_t5 import MyT5RoPE
+from .rope_t5 import T5ModelRoPE
 from ..utils import mean_pooling
 from .linear import LinearHead
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,8 @@ class DRModel(nn.Module):
             lm_q: PreTrainedModel,
             lm_p: PreTrainedModel,
             tied: bool = True,
+            maxp: int = None,
+            fusion: int = None,
             feature: str = "last_hidden_state",
             pooling: str = "first",
             head_q: nn.Module = None,
@@ -64,6 +70,8 @@ class DRModel(nn.Module):
         self.model_args = model_args
         self.train_args = train_args
         self.data_args = data_args
+        self.maxp = maxp
+        self.fusion = fusion
 
         if train_args is not None:
             if train_args.distillation:
@@ -107,8 +115,8 @@ class DRModel(nn.Module):
 
             if self.train_args.distil_mode == "pairwise":
 
-                pos_hidden, pos_reps = self.encode_passage(positive)
-                neg_hidden, neg_reps = self.encode_passage(negative)
+                pos_hidden, pos_reps = self.encode_passage(positive, self.fusion)
+                neg_hidden, neg_reps = self.encode_passage(negative, self.fusion)
                 scores_pos = torch.sum(q_reps * pos_reps, dim=1)
                 scores_neg = torch.sum(q_reps * neg_reps, dim=1)
                 margin_pred = scores_pos - scores_neg
@@ -117,7 +125,7 @@ class DRModel(nn.Module):
 
             else:  # listwise
                 # (batch_size * n_passages, hidden_size)
-                p_hidden, p_reps = self.encode_passage(passage)
+                p_hidden, p_reps = self.encode_passage(passage, self.fusion)
                 batch_size = q_reps.shape[0]
                 # (batch_size, n_passages, hidden_size)
                 p_reps = p_reps.view(batch_size, -1, p_reps.shape[-1])
@@ -133,7 +141,7 @@ class DRModel(nn.Module):
 
         else:
 
-            p_hidden, p_reps = self.encode_passage(passage)
+            p_hidden, p_reps = self.encode_passage(passage, self.fusion)
 
             if q_reps is None or p_reps is None:
                 return DROutput(
@@ -151,6 +159,9 @@ class DRModel(nn.Module):
                 else self.train_args.per_device_train_batch_size
 
             scores = torch.matmul(q_reps, p_reps.transpose(0, 1))
+
+            if self.maxp:
+                scores = torch.max(scores.view(scores.size(0),int(scores.size(1)/self.maxp), self.maxp), dim=2).values
 
             target = torch.arange(
                 scores.size(0),
@@ -170,7 +181,7 @@ class DRModel(nn.Module):
                 p_reps=p_reps
             )
 
-    def encode(self, items, model, head, is_q=False):
+    def encode(self, items, model, head, is_q=False, fusion=None):
         if items is None:
             return None, None
         items = BatchEncoding(items)
@@ -178,13 +189,20 @@ class DRModel(nn.Module):
         if ("T5" in type(model).__name__) and (not self.model_args.encoder_only) and (type(model).__name__ != "T5EncoderModel"):
             decoder_input_ids = torch.zeros(
                 (items.input_ids.shape[0], 1), dtype=torch.long).to(items.input_ids.device)
-            items_out = model(
-                **items, decoder_input_ids=decoder_input_ids, return_dict=True)
+            
+            if fusion:
+
+                items_out = model(
+                    **items, decoder_input_ids=decoder_input_ids, fusion=fusion, return_dict=True)
+            else:
+                items_out = model(
+                    **items, decoder_input_ids=decoder_input_ids, return_dict=True)
             if hasattr(items_out,'last_hidden_state'):
                 hidden = items_out.last_hidden_state
                 reps = hidden[:, 0, :]
             else:
-                hidden = items_out.decoder_hidden_states[-1]
+                #hidden = items_out.decoder_hidden_states[-1]
+                hidden = items_out.decoder_hidden_states
                 reps = hidden[:, 0, :]
         elif "CLIP" in type(model).__name__:
             reps = hidden = items_out = model.get_text_features(
@@ -207,8 +225,8 @@ class DRModel(nn.Module):
             reps = F.normalize(reps, dim=1)
         return hidden, reps
 
-    def encode_passage(self, psg):
-        return self.encode(psg, self.lm_p, self.head_p)
+    def encode_passage(self, psg, fusion):
+        return self.encode(psg, self.lm_p, self.head_p, fusion=fusion)
 
     def encode_query(self, qry):
         return self.encode(qry, self.lm_q, self.head_q)
@@ -235,8 +253,23 @@ class DRModel(nn.Module):
             if tied:
                 logger.info(f'loading model weight from {model_name_or_path}')
                 model_name = config["plm_backbone"]["type"]
-                model_class = getattr(
-                    importlib.import_module("transformers"), model_name)
+
+                try:
+                    model_class = getattr(
+                        importlib.import_module("transformers"), model_name)
+                except AttributeError:
+                    try:
+                        model_class = getattr(
+                            importlib.import_module(".custom_models", package=__package__), model_name)
+                    except AttributeError:
+                        try:
+                            model_class = getattr(
+                                importlib.import_module(".nano_t5", package=__package__), model_name)
+                        except AttributeError:
+                            model_class = getattr(
+                                importlib.import_module(".rope_t5", package=__package__), model_name)
+
+
                 lm_q = lm_p = model_class.from_pretrained(
                     model_name_or_path,
                     **hf_kwargs
@@ -289,8 +322,26 @@ class DRModel(nn.Module):
                     head_p = LinearHead.load(_psg_head_path)
         else:  # a Huggingface model
             tied = not model_args.untie_encoder
-            model_class = T5EncoderModel if model_args.encoder_only else AutoModel
-            lm_q = model_class.from_pretrained(model_name_or_path, **hf_kwargs)
+
+            if model_args.encoder_only:
+                model_class = T5EncoderModel
+            elif model_args.fusion:
+                model_class = T5ModelWithFusion
+                print("Loading FiD T5")
+            elif model_args.rope:
+                model_class = T5ModelRoPE
+                print("Loading RoPE T5!!!!")
+            else:
+                model_class = AutoModel
+            try:
+                lm_q = model_class.from_pretrained(model_name_or_path, **hf_kwargs)
+                print("Loaded!!! Class:")
+                print(model_class)
+            except AttributeError as e:
+                print("Custom implementation without from_pretrained. Manually loading from config and state dict.")
+                lm_q = model_class(AutoConfig.from_pretrained(model_name_or_path))
+                lm_q.load_state_dict(torch.load(f"{model_name_or_path}/pytorch_model.bin"), strict=False)
+                print("done")
             lm_p = copy.deepcopy(lm_q) if not tied else lm_q
             if model_args.add_linear_head:
                 head_q = LinearHead(
@@ -309,6 +360,8 @@ class DRModel(nn.Module):
             model_args=model_args,
             data_args=data_args,
             train_args=train_args,
+            maxp=model_args.maxp,
+            fusion=model_args.fusion
         )
         return model
 
@@ -351,8 +404,8 @@ class DRModelForInference(DRModel):
         # self.eval()
 
     @torch.no_grad()
-    def encode_passage(self, psg):
-        return super(DRModelForInference, self).encode_passage(psg)
+    def encode_passage(self, psg, fusion):
+        return super(DRModelForInference, self).encode_passage(psg, fusion)
 
     @torch.no_grad()
     def encode_query(self, qry):
@@ -364,5 +417,5 @@ class DRModelForInference(DRModel):
             passage: Dict[str, Tensor] = None,
     ):
         q_hidden, q_reps = self.encode_query(query)
-        p_hidden, p_reps = self.encode_passage(passage)
+        p_hidden, p_reps = self.encode_passage(passage, self.fusion)
         return DROutput(q_reps=q_reps, p_reps=p_reps)

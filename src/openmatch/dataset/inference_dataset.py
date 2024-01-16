@@ -47,7 +47,9 @@ class InferenceDataset():
         num_processes: int = 1,
         process_index: int = 0,
         filter_fn: Callable = lambda x: True,
-        cache_dir: str = None
+        cache_dir: str = None,
+        maxp: int = None,
+        fusion: int = None
     ):
         self.cache_dir = cache_dir
         self.is_query = is_query
@@ -57,6 +59,8 @@ class InferenceDataset():
         self.processor = processor
         self.max_len = max_len
         self.is_image = False
+        self.maxp = maxp
+        self.fusion = fusion
 
         self.template = template
         self.column_names = column_names
@@ -90,7 +94,7 @@ class InferenceDataset():
         data_args: DataArguments = None, 
         data: List[Dict] = None,
         data_files: Union[str, List[str]] = None,
-        max_len: int = 128,
+        max_len: int = None,
         template: str = None,
         column_names: str = None,
         all_markers: str = None,
@@ -104,7 +108,9 @@ class InferenceDataset():
         num_processes: int = 1,
         process_index: int = 0,
         filter_fn: Callable = lambda x: True,
-        cache_dir: str = None
+        cache_dir: str = None,
+        maxp: int = None,
+        fusion: int = None
     ):
         max_len = max_len if max_len is not None else data_args.q_max_len if is_query else data_args.p_max_len
         template = template if template is not None else data_args.query_template if is_query else data_args.doc_template
@@ -126,7 +132,9 @@ class InferenceDataset():
                 num_processes=num_processes,
                 process_index=process_index,
                 filter_fn=filter_fn,
-                cache_dir=cache_dir
+                cache_dir=cache_dir,
+                maxp=maxp,
+                fusion=fusion
             )
         if data_files is not None:
             data_files = [data_files] if isinstance(data_files, str) else data_files
@@ -156,7 +164,9 @@ class InferenceDataset():
             num_processes=num_processes,
             process_index=process_index,
             filter_fn=filter_fn,
-            cache_dir=cache_dir
+            cache_dir=cache_dir,
+            maxp=maxp,
+            fusion=fusion
         )
 
     def _tokenize(self, example: str):
@@ -186,10 +196,34 @@ class InferenceDataset():
                 tokenized[marker] = dict(self._tokenize(example[marker])) if (marker in example and example[marker] is not None) else None
             return {"text_id": example_id, **tokenized}
         else:
-            example_id = get_idx(example)
-            full_text = fill_template(self.template, example, self.all_markers, allow_not_found=True)
-            tokenized = self._tokenize(full_text)
-            return {"text_id": example_id, **tokenized}
+            if not self.maxp and not self.fusion:
+                example_id = get_idx(example)
+                full_text = fill_template(self.template, example, self.all_markers, allow_not_found=True)
+                tokenized = self._tokenize(full_text)
+                return {"text_id": example_id, **tokenized}
+            else:
+
+                example_id = get_idx(example)
+
+                text_values = example['text'].split('[PSEP]')
+                split_examples = [{'text': value, **{k: v for k, v in example.items() if k != 'text'}} for value in text_values]
+                
+                if self.maxp:
+                    assert len(split_examples) == self.maxp
+                elif self.fusion:
+                    assert len(split_examples) == self.fusion
+                else:
+                    raise RuntimeError("Unspecified sentence splitting operation")
+
+                all_texts = []
+                for split_example in split_examples:
+                    full_text = fill_template(self.template, split_example, self.all_markers, allow_not_found=True)
+                    all_texts.append(full_text)
+
+                tokenized = self._tokenize(all_texts)
+
+                return {"text_id": example_id, **tokenized}
+
 
 
 class StreamInferenceDataset(IterableDataset):

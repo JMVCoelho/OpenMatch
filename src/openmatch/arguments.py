@@ -42,6 +42,21 @@ class ModelArguments:
         metadata={"help": "How to pool the features from the HF PLM"}
     )
 
+    maxp: int = field(
+        default=None,
+        metadata={"help": "number of maxp passages. defaults to none - no maxp."}
+    )
+
+    fusion: int = field(
+        default=None,
+        metadata={"help": "number of fusion in decoder passages. defaults to none - no fusion in decoder."}
+    )
+
+    rope: bool = field(
+        default=False,
+        metadata={"help": "set true for T5 with RoPE."}
+    )
+
     # out projection
     add_linear_head: bool = field(default=False)
     projection_in_dim: int = field(default=768)

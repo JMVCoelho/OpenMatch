@@ -16,6 +16,12 @@ We do not include all the requirements in the package. You may need to manually 
 
 You may also need faiss for dense retrieval. You can install either `faiss-cpu` or `faiss-gpu`, according to your enviroment. Note that if you want to perform search on GPUs, you need to install the version of `faiss-gpu` compatible with your CUDA. In some cases (usually CUDA >= 11.0) `pip` installs a wrong version. If you encounter errors during search on GPUs, you may try installing it from `conda`. 
 
+JMC:  
+On my current machine
+`pip install torch==2.0.0 torchvision==0.15.1 torchaudio==2.0.1`  
+`conda install -c conda-forge faiss-gpu`
+`install transformers 4.21.3 or it breaks in eval`
+`install protobuf==3.20 or it breaks in inference`
 ## Features
 
 - Human-friendly interface for dense retriever and re-ranker training and testing
