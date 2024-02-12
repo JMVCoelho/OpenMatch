@@ -113,6 +113,7 @@ class InferenceDataset():
         fusion: int = None
     ):
         max_len = max_len if max_len is not None else data_args.q_max_len if is_query else data_args.p_max_len
+        print("MAX LEN:", max_len)
         template = template if template is not None else data_args.query_template if is_query else data_args.doc_template
         column_names = column_names if column_names is not None else data_args.query_column_names if is_query else data_args.doc_column_names
         all_markers = all_markers if all_markers is not None else data_args.all_markers

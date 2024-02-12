@@ -21,8 +21,7 @@ from ..arguments import DataArguments
 from ..arguments import DRTrainingArguments as TrainingArguments
 from ..arguments import ModelArguments
 from .custom_models import T5ModelWithFusion
-from .nano_t5 import MyT5RoPE
-from .rope_t5 import T5ModelRoPE
+from .rope_t5 import T5ModelRoPE, T5EncoderModelRoPE
 from ..utils import mean_pooling
 from .linear import LinearHead
 
@@ -64,7 +63,7 @@ class DRModel(nn.Module):
         self.head_p = head_p
 
         self.feature = feature
-        self.pooling = pooling
+        self.pooling = pooling if not model_args.pooling else model_args.pooling
         self.normalize = normalize
 
         self.model_args = model_args
@@ -269,7 +268,8 @@ class DRModel(nn.Module):
                             model_class = getattr(
                                 importlib.import_module(".rope_t5", package=__package__), model_name)
 
-
+                #model_class = T5EncoderModelRoPE
+                #print(f"USING {model_class} check if its what u want")
                 lm_q = lm_p = model_class.from_pretrained(
                     model_name_or_path,
                     **hf_kwargs
@@ -325,6 +325,8 @@ class DRModel(nn.Module):
 
             if model_args.encoder_only:
                 model_class = T5EncoderModel
+                #model_class = T5EncoderModelRoPE
+                #print(f"USING {model_class} check if its what u want")
             elif model_args.fusion:
                 model_class = T5ModelWithFusion
                 print("Loading FiD T5")

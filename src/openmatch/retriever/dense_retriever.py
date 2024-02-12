@@ -135,6 +135,7 @@ class Retriever:
             "Initializing Faiss index from pre-computed document embeddings")
         partitions = [partition] if partition is not None else glob.glob(
             os.path.join(self.args.output_dir, "embeddings.corpus.rank.*"))
+        print(f"Found {len(partitions)} files")
         for i, part in enumerate(partitions):
             with open(part, 'rb') as f:
                 data = pickle.load(f)
@@ -144,6 +145,7 @@ class Retriever:
                 dim = encoded.shape[1]
                 self._initialize_faiss_index(dim)
             self.index.add(encoded)
+            print(len(encoded))
             self.doc_lookup.extend(lookup_indices)
 
     @classmethod

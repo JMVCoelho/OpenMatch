@@ -149,9 +149,10 @@ class SimpleCollectionPreProcessor:
 
     def process_line(self, line: str):
         xx = line.strip().split(self.separator)
-        text_id, text = xx[0], xx[1:]
+        text_id, title, text = xx[0], xx[1], xx[2]
+        text_to_encode = f"{title} {text}"
         text_encoded = self.tokenizer.encode(
-            self.tokenizer.sep_token.join(text),
+            text_to_encode,
             add_special_tokens=False,
             max_length=self.max_length,
             truncation=True

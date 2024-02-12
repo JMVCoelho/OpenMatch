@@ -224,6 +224,10 @@ class DRPretrainDataset(TrainDatasetBase):
 
     def create_one_example(self, text_encoding: List[int], is_query=False) -> BatchEncoding:
         text_encoding = self.apply_strategy(text_encoding)
+        if text_encoding == []:
+            text_encoding = [0]
+            print("err-encoding-tok")
+        
         item = self.tokenizer.encode_plus(
             text_encoding,
             truncation='only_first',
@@ -232,6 +236,7 @@ class DRPretrainDataset(TrainDatasetBase):
             return_attention_mask=False,
             return_token_type_ids=False,
         )
+
         return item
 
     def get_process_fn(self, epoch, hashed_seed):

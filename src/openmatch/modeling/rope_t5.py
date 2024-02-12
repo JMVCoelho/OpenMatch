@@ -48,6 +48,67 @@ from transformers.utils.model_parallel_utils import assert_device_map, get_devic
 from transformers import T5Config
 
 
+
+from packaging import version
+
+import importlib.util
+
+def _is_package_available(pkg_name: str, return_version: bool = False):
+    # Check we're not importing a "pkg_name" directory somewhere but the actual library by trying to grab the version
+    package_exists = importlib.util.find_spec(pkg_name) is not None
+    package_version = "N/A"
+    if package_exists:
+        try:
+            package_version = importlib.metadata.version(pkg_name)
+            package_exists = True
+        except importlib.metadata.PackageNotFoundError:
+            package_exists = False
+    if return_version:
+        return package_exists, package_version
+    else:
+        return package_exists
+
+def is_flash_attn_2_available():
+    if not _is_package_available("flash_attn"):
+        return False
+
+    # Let's add an extra check to see if cuda is available
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+
+    if torch.version.cuda:
+        return version.parse(importlib.metadata.version("flash_attn")) >= version.parse("2.1.0")
+    elif torch.version.hip:
+        # TODO: Bump the requirement to 2.1.0 once released in https://github.com/ROCmSoftwarePlatform/flash-attention
+        return version.parse(importlib.metadata.version("flash_attn")) >= version.parse("2.0.4")
+    else:
+        return False
+
+def is_flash_attn_greater_or_equal_2_10():
+    if not _is_package_available("flash_attn"):
+        return False
+
+    return version.parse(importlib.metadata.version("flash_attn")) >= version.parse("2.1.0")
+
+
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "T5Config"
@@ -454,7 +515,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 class T5AttentionRoPE(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+    def __init__(self, config: T5Config, is_causal: bool, has_relative_attention_bias=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
@@ -466,6 +527,7 @@ class T5AttentionRoPE(nn.Module):
         self.head_dim = self.d_model // self.n_heads
         self.dropout = config.dropout_rate
         self.inner_dim = self.n_heads * self.key_value_proj_dim
+        self.is_causal = is_causal
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
@@ -576,17 +638,36 @@ class T5AttentionRoPE(nn.Module):
         if past_key_value is not None:
             past_key_values_length = past_key_value[0][0].shape[2]
 
-        position_ids = torch.arange(
-            past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
-        )
-        position_ids = position_ids.unsqueeze(0)
 
-        if key_states.shape[-2] == query_states.shape[-2]:
+
+        if key_states.shape[-2] == query_states.shape[-2]: # self attention
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
+            )
+            position_ids = position_ids.unsqueeze(0)
+
             kv_seq_len = key_states.shape[-2]
             if past_key_value is not None:
                 kv_seq_len += past_key_value[0].shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        # else: # cross attention!
+        #     key_len = key_states.shape[-2]
+        #     k_cos, k_sin = self.rotary_emb(value_states, seq_len=key_len)
+        #     q_len = query_states.shape[-2]
+        #     q_cos, q_sin = self.rotary_emb(value_states, seq_len=q_len)
+
+        #     key_position_ids = torch.arange(
+        #         past_key_values_length, key_len + past_key_values_length, dtype=torch.long, device=hidden_states.device
+        #     ).unsqueeze(0)
+
+        #     query_position_ids = torch.arange(
+        #         0, q_len, dtype=torch.long, device=hidden_states.device
+        #     ).unsqueeze(0)
+
+        #     query_states, _ = apply_rotary_pos_emb(query_states, None, q_cos, q_sin, query_position_ids)
+        #     _, key_states = apply_rotary_pos_emb(None, key_states, k_cos, k_sin, key_position_ids)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -608,6 +689,7 @@ class T5AttentionRoPE(nn.Module):
             attn_weights, p=self.dropout, training=self.training
         )  # (batch_size, n_heads, seq_length, key_length)
 
+
         # Mask heads if we want to
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
@@ -623,10 +705,270 @@ class T5AttentionRoPE(nn.Module):
         return outputs
 
 
+class T5FlashAttentionRoPE(T5AttentionRoPE):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    
+    def forward(
+        self,
+        hidden_states,
+        mask=None,
+        key_value_states=None,
+        position_bias=None,
+        past_key_value=None,
+        layer_head_mask=None,
+        query_length=None,
+        use_cache=False,
+        output_attentions=False,
+    ):
+        """
+        Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
+        """
+        # Input is (batch_size, seq_length, dim)
+        # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
+        # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
+
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        real_seq_length = seq_length
+
+        if past_key_value is not None:
+            assert (
+                len(past_key_value) == 2
+            ), f"past_key_value should have 2 past states: keys and values. Got { len(past_key_value)} past states"
+            real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
+
+        key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
+
+        def shape(states):
+            """projection"""
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+
+        def unshape(states):
+            """reshape"""
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+
+        def project(hidden_states, proj_layer, key_value_states, past_key_value):
+            """projects hidden states correctly to key/query states"""
+            if key_value_states is None:
+                # self-attn
+                # (batch_size, n_heads, seq_length, dim_per_head)
+                hidden_states = shape(proj_layer(hidden_states))
+            elif past_key_value is None:
+                # cross-attn
+                # (batch_size, n_heads, seq_length, dim_per_head)
+                hidden_states = shape(proj_layer(key_value_states))
+
+            if past_key_value is not None:
+                if key_value_states is None:
+                    # self-attn
+                    # (batch_size, n_heads, key_length, dim_per_head)
+                    hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+                else:
+                    # cross-attn
+                    hidden_states = past_key_value
+            return hidden_states
+
+        # get query states
+        query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+
+        # get key/value states
+        key_states = project(
+            hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+        )
+        value_states = project(
+            hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+        )
+
+        position_bias = None 
+        
+        past_key_values_length = 0
+        if past_key_value is not None:
+            past_key_values_length = past_key_value[0][0].shape[2]
+
+        position_ids = torch.arange(
+            past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
+        )
+        position_ids = position_ids.unsqueeze(0)
+
+
+        if key_states.shape[-2] == query_states.shape[-2]: # self attention
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
+            )
+            position_ids = position_ids.unsqueeze(0)
+
+            kv_seq_len = key_states.shape[-2]
+            if past_key_value is not None:
+                kv_seq_len += past_key_value[0].shape[-2]
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        # else: # cross attention!
+        #     key_len = key_states.shape[-2]
+        #     k_cos, k_sin = self.rotary_emb(value_states, seq_len=key_len)
+        #     q_len = query_states.shape[-2]
+        #     q_cos, q_sin = self.rotary_emb(value_states, seq_len=q_len)
+
+        #     key_position_ids = torch.arange(
+        #         past_key_values_length, key_len + past_key_values_length, dtype=torch.long, device=hidden_states.device
+        #     ).unsqueeze(0)
+
+        #     query_position_ids = torch.arange(
+        #         0, q_len, dtype=torch.long, device=hidden_states.device
+        #     ).unsqueeze(0)
+
+        #     query_states, _ = apply_rotary_pos_emb(query_states, None, q_cos, q_sin, query_position_ids)
+        #     _, key_states = apply_rotary_pos_emb(None, key_states, k_cos, k_sin, key_position_ids)
+
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+
+        query_states = query_states.permute(0, 2, 1, 3)
+        key_states = key_states.permute(0, 2, 1, 3)
+        value_states = value_states.permute(0, 2, 1, 3)
+
+
+        if mask.shape[2] != 1:
+            new_attention_mask = None
+            assert self.is_causal
+
+        else:
+            squeezed_mask = mask.squeeze(dim=1).squeeze(dim=1)
+            new_attention_mask = torch.where(squeezed_mask != 0.0, torch.tensor(0), torch.tensor(1))
+
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, new_attention_mask, query_states.shape[1], dropout=0.0, softmax_scale=1
+        )
+
+
+        # Mask heads if we want to
+        #if layer_head_mask is not None:
+        #    attn_weights = attn_weights * layer_head_mask
+
+        attn_output = attn_output.reshape(batch_size, query_states.shape[1], self.inner_dim).contiguous() # (batch_size, seq_length, dim)
+        attn_output = self.o(attn_output)
+
+
+        present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+        outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+        if output_attentions:
+            outputs = outputs + (attn_weights,)
+        return outputs
+
+    def _flash_attention_forward(
+        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+    ):
+        """
+        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
+        first unpad the input, then computes the attention scores and pad the final attention scores.
+
+        Args:
+            query_states (`torch.Tensor`):
+                Input query states to be passed to Flash Attention API
+            key_states (`torch.Tensor`):
+                Input key states to be passed to Flash Attention API
+            value_states (`torch.Tensor`):
+                Input value states to be passed to Flash Attention API
+            attention_mask (`torch.Tensor`):
+                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+                position of padding tokens and 1 for the position of non-padding tokens.
+            dropout (`int`, *optional*):
+                Attention dropout
+            softmax_scale (`float`, *optional*):
+                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+        """
+        if not self._flash_attn_uses_top_left_mask:
+            causal = self.is_causal
+        else:
+            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
+            causal = self.is_causal and query_length != 1
+
+        # Contains at least one padding token in the sequence
+        if attention_mask is not None and torch.any(attention_mask == 0.0).item():
+            batch_size = query_states.shape[0]
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
+
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+
+            attn_output_unpad = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+
+            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        else:
+            attn_output = flash_attn_func(
+                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+            )
+
+        return attn_output
+
+    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(
+                query_layer.reshape(batch_size * kv_seq_len, self.n_heads, head_dim), indices_k
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q,
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, is_causal, has_relative_attention_bias=False):
         super().__init__()
-        self.SelfAttention = T5AttentionRoPE(config, has_relative_attention_bias=has_relative_attention_bias)
+        self.SelfAttention = T5FlashAttentionRoPE(config, has_relative_attention_bias=has_relative_attention_bias, is_causal=is_causal)
+        #self.SelfAttention = T5AttentionRoPE(config, has_relative_attention_bias=has_relative_attention_bias, is_causal=is_causal)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -656,9 +998,10 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerCrossAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_causal):
         super().__init__()
-        self.EncDecAttention = T5AttentionRoPE(config, has_relative_attention_bias=False)
+        self.EncDecAttention = T5FlashAttentionRoPE(config, is_causal, has_relative_attention_bias=False)
+        #self.EncDecAttention = T5AttentionRoPE(config, is_causal, has_relative_attention_bias=False)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -696,9 +1039,13 @@ class T5Block(nn.Module):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
-        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
+        
         if self.is_decoder:
-            self.layer.append(T5LayerCrossAttention(config))
+            self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias, is_causal=True))
+            self.layer.append(T5LayerCrossAttention(config, is_causal=False))
+        
+        else:
+            self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias, is_causal=False))
 
         self.layer.append(T5LayerFF(config))
 
@@ -833,7 +1180,7 @@ class T5PreTrainedModel(PreTrainedModel):
         factor = self.config.initializer_factor  # Used for testing weights initialization
         if isinstance(module, T5LayerNorm):
             module.weight.data.fill_(factor * 1.0)
-        elif isinstance(module, (T5ModelRoPE, T5ForConditionalGenerationRoPE, T5EncoderModel)):
+        elif isinstance(module, (T5ModelRoPE, T5ForConditionalGenerationRoPE, T5EncoderModelRoPE)):
             # Mesh TensorFlow embeddings initialization
             # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L1624
             module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
@@ -869,8 +1216,6 @@ class T5PreTrainedModel(PreTrainedModel):
             module.k.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
             module.v.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
             module.o.weight.data.normal_(mean=0.0, std=factor * ((n_heads * key_value_proj_dim) ** -0.5))
-            if module.has_relative_attention_bias:
-                module.relative_attention_bias.weight.data.normal_(mean=0.0, std=factor * ((d_model) ** -0.5))
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (T5AttentionRoPE, T5Stack)):
@@ -1820,7 +2165,7 @@ class T5ForConditionalGenerationRoPE(T5PreTrainedModel):
     "The bare T5 Model transformer outputting encoder's raw hidden-states without any specific head on top.",
     T5_START_DOCSTRING,
 )
-class T5EncoderModel(T5PreTrainedModel):
+class T5EncoderModelRoPE(T5PreTrainedModel):
     authorized_missing_keys = [
         r"encoder.embed_tokens.weight",
     ]
